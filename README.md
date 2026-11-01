@@ -1,6 +1,6 @@
 ```
  ╔══════════════════════════════════════════════════════════════╗
- ║  K8s-on-EC2  –  Terraform Project  (College Edition)        ║
+ ║  K8s-on-EC2  –  Terraform Project  (College Edition)         ║
  ╚══════════════════════════════════════════════════════════════╝
 ```
 
