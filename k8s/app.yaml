@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoscaler-app
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flask-app-code
+  namespace: autoscaler-app
+data:
+  app.py: |
+    import time
+    import os
+    import math
+    import socket
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+    HOSTNAME = socket.gethostname()
+
+    stats = {
+        "requests": 0,
+        "total_latency_ms": 0.0,
+        "latencies": []
+    }
+
+    @app.route("/", methods=["GET"])
+    def index():
+        return jsonify({
+            "status": "healthy",
+            "service": "k8s-cost-autoscaler-workload",
+            "pod": HOSTNAME
+        })
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        return "OK", 200
+
+    @app.route("/work", methods=["GET", "POST"])
+    def work():
+        start_time = time.time()
+        cpu_ms = float(request.args.get("cpu_ms", 10.0))
+        io_ms = float(request.args.get("io_ms", 5.0))
+        
+        if cpu_ms > 0:
+            burn_end = time.time() + (cpu_ms / 1000.0)
+            x = 0.0001
+            while time.time() < burn_end:
+                x = math.sin(x) + math.cos(x)
+                
+        if io_ms > 0:
+            time.sleep(io_ms / 1000.0)
+            
+        duration_ms = (time.time() - start_time) * 1000.0
+        stats["requests"] += 1
+        stats["total_latency_ms"] += duration_ms
+        stats["latencies"].append(duration_ms)
+        if len(stats["latencies"]) > 1000:
+            stats["latencies"].pop(0)
+
+        return jsonify({
+            "pod": HOSTNAME,
+            "duration_ms": round(duration_ms, 2),
+            "requests_processed": stats["requests"]
+        })
+
+    @app.route("/stats", methods=["GET"])
+    def get_stats():
+        latencies = sorted(stats["latencies"])
+        p95 = latencies[int(len(latencies) * 0.95)] if latencies else 0.0
+        avg = (stats["total_latency_ms"] / stats["requests"]) if stats["requests"] > 0 else 0.0
+        return jsonify({
+            "pod": HOSTNAME,
+            "total_requests": stats["requests"],
+            "avg_latency_ms": round(avg, 2),
+            "p95_latency_ms": round(p95, 2),
+            "sample_size": len(latencies)
+        })
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-api
+  namespace: autoscaler-app
+  labels:
+    app: flask-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flask-api
+  template:
+    metadata:
+      labels:
+        app: flask-api
+    spec:
+      containers:
+      - name: flask-api
+        image: python:3.11-slim
+        command: ["sh", "-c", "pip install --no-cache-dir flask requests && python /app/app.py"]
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+      volumes:
+      - name: app-code
+        configMap:
+          name: flask-app-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+  namespace: autoscaler-app
+spec:
+  type: NodePort
+  selector:
+    app: flask-api
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080
+

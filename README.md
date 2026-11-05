@@ -1,203 +1,115 @@
-```
- ╔══════════════════════════════════════════════════════════════╗
- ║  K8s-on-EC2  –  Terraform Project  (College Edition)        ║
- ╚══════════════════════════════════════════════════════════════╝
-```
+# Cost-per-Request Custom Autoscaler for Kubernetes on AWS EC2
 
-# Kubernetes-on-EC2 Terraform Project
-
-A modular Terraform project that provisions a self-managed Kubernetes
-cluster on AWS EC2.  Designed for a college project: low cost, clean
-code, and least-privilege IAM that you can defend in a viva.
+> A self-built autoscaler that watches AWS CloudWatch metrics, decides pod replica counts by evaluating the **dollar cost per served request** of candidate configurations subject to an SLO feasibility ceiling, emits structured counterfactual decision logs, and is benchmarked under chaos-style traffic, injected telemetry delays, and safety ablations.
 
 ---
 
-## File Tree
+## 1. Project Overview & Motivation
+
+Default Kubernetes autoscaling (e.g. Horizontal Pod Autoscaler - HPA) and AWS Auto Scaling rely primarily on static utilization thresholds (e.g., scale out when average CPU exceeds 50–70%). This project replaces standard threshold-based scaling with a **cost-optimal, SLO-aware decision loop (MAPE-K)**:
+
+1. **Monitor**: Collects CPU, memory, request arrival rate (RPS), and p95 latency from AWS CloudWatch.
+2. **Analyse**: Normalizes metrics and calculates a weighted pressure score $S = w_{\text{cpu}}\text{cpu} + w_{\text{mem}}\text{mem} + w_{\text{rps}}\text{rps} + w_{\text{lat}}\text{lat}$.
+3. **Plan**: Evaluates candidate replica states ($n-1, n, n+1$). Filters out candidates that breach latency SLOs or capacity ceilings ($>70\%$ utilization). Among feasible candidates, selects the one minimizing **cost per request**:
+   $$\text{cost\_per\_request}(n) = \frac{\text{cost\_per\_hour}(n)}{\text{served\_rps}(n) \times 3600}$$
+4. **Execute**: Applies safety guardrails (cooldown, hysteresis, hard min/max limits, step size clamps) and executes `kubectl scale`.
+5. **Knowledge**: Writes explainable JSON records containing **counterfactual rationales** (why each alternative was accepted or rejected) and syncs logs to an encrypted S3 bucket.
+
+---
+
+## 2. Research Contributions & Novelty Matrix
+
+| ID | Contribution | Defense & Novelty Justification |
+|---|---|---|
+| **N1** | **Cost-per-Request Candidate Scoring** | While literature primarily evaluates cost retroactively in node-hours or replica counts, this scaler directly employs real-time dollars-per-served-request as the live optimization objective under an SLO constraint. |
+| **N2** | **Counterfactual Explainable Decision Logs** | Emits JSON logs capturing candidate-by-candidate evaluations, explaining why $n-1$ or $n+1$ were rejected (e.g. predicted SLO breach or sub-optimal unit cost). |
+| **N3** | **Delay-Stratified Chaos Benchmarking** | Injects artificial telemetry delays $D \in \{0, 60, 120, 180\}$ seconds to systematically quantify how CloudWatch aggregation delays degrade reactive controllers versus cost-aware controllers. |
+| **N4** | **Cost-of-Safety Ablation Study** | Systematically disables guardrails (cooldown, hysteresis) to measure the exact trade-off between infrastructure spend, replica churn, and SLO breaches. |
+
+---
+
+## 3. System Architecture
 
 ```
-k8s-terraform/
-├── main.tf                      # Root module – wires all child modules
-├── providers.tf                 # AWS provider & Terraform version pins
-├── backend.tf                   # Remote state config (S3+DynamoDB, commented)
-├── variables.tf                 # All input variables with defaults
-├── outputs.tf                   # Exported values (IPs, ARNs, bucket name)
-├── terraform.tfvars.example     # Copy → terraform.tfvars, fill in your values
-│
-└── modules/
-    ├── network/                 # VPC, 2 public subnets, IGW, route table, SG
-    │   ├── main.tf
-    │   ├── variables.tf
-    │   └── outputs.tf
-    │
-    ├── iam/                     # Two least-privilege roles + instance profiles
-    │   ├── main.tf
-    │   ├── variables.tf
-    │   └── outputs.tf
-    │
-    ├── storage/                 # S3 bucket (versioned, encrypted, no public)
-    │   ├── main.tf
-    │   ├── variables.tf
-    │   └── outputs.tf
-    │
-    └── compute/                 # 1 control-plane + 2 worker EC2 instances
-        ├── main.tf
-        ├── variables.tf
-        └── outputs.tf
-```
-
----
-
-## What Each File Does
-
-| File | Purpose |
-|------|---------|
-| `main.tf` | Looks up the latest Ubuntu 22.04 AMI, then calls network → storage → iam → compute in dependency order. |
-| `providers.tf` | Pins Terraform ≥ 1.5 and the `hashicorp/aws` provider ~> 5.0. Sets default tags. |
-| `backend.tf` | Commented-out S3 backend block. Uncomment once you have a state bucket + DynamoDB lock table. |
-| `variables.tf` | Declares every tuneable knob (region, instance types, CIDRs, key pair, etc.). |
-| `outputs.tf` | Surfaces control-plane IP, worker IPs, S3 bucket name, and both role ARNs. |
-| `terraform.tfvars.example` | Template – copy it, set your key pair and SSH CIDR. |
-
-### Module: `network`
-Creates a VPC with DNS support, an Internet Gateway, two public subnets
-(one per AZ), a shared route table, and a security group with rules for:
-SSH, K8s API (6443), intra-cluster traffic, NodePorts, HTTP/S, and all
-outbound.
-
-### Module: `storage`
-Creates one S3 bucket with:
-- **Versioning** enabled (protects against accidental overwrites).
-- **SSE-S3 encryption** (AES-256) on all objects.
-- **Public access block** on all four toggles.
-- **Lifecycle rule** that expires old log versions after 30 days.
-
-### Module: `iam`
-Two IAM roles, each with its own instance profile:
-
-1. **Node role** (`k8s-college-node-role`)
-2. **Scaler role** (`k8s-college-scaler-role`)
-
-See the IAM Policy Deep-Dive below.
-
-### Module: `compute`
-Launches 1 control-plane (`t3.medium`) and 2 workers (`t3.small`).
-All instances:
-- Use gp3 encrypted 20 GB root volumes.
-- Run a `user_data` script that disables swap, loads `overlay` and
-  `br_netfilter`, and sets the required sysctl params for kubelet.
-- Are spread across the two subnets/AZs.
-
----
-
-## IAM Policy Deep-Dive  (Viva-Ready Explanations)
-
-### Role 1 – Node Role
-
-| # | Policy | Actions | Resource | Why |
-|---|--------|---------|----------|-----|
-| 1a | `node-cw-policy` | `cloudwatch:PutMetricData` | `*` (with condition `cloudwatch:namespace = k8s-college/K8sMetrics`) | Nodes push custom K8s metrics (CPU, pod count) to CloudWatch. `PutMetricData` does **not** support resource-level ARNs per [AWS docs](https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazoncloudwatch.html), so the resource is `*`. The namespace condition restricts writes to our project namespace only. |
-| 1b | `node-s3-policy` | `s3:ListBucket` | `arn:aws:s3:::k8s-college-cluster-<acct>` | Nodes need to list objects in the bucket to find configs. Scoped to exactly one bucket. |
-| 1b | `node-s3-policy` | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `arn:aws:s3:::k8s-college-cluster-<acct>/*` | Nodes read bootstrap scripts and write cluster state. Scoped to objects inside that single bucket only. |
-
-### Role 2 – Scaler Role
-
-| # | Policy | Actions | Resource | Why |
-|---|--------|---------|----------|-----|
-| 2a | `scaler-cw-policy` | `cloudwatch:GetMetricData` | `*` | The scaler reads metrics to decide when to scale. `GetMetricData` is a batch read-only API; it does not support resource-level ARNs. |
-| 2b | `scaler-ec2-policy` | `ec2:DescribeInstances`, `ec2:DescribeSpotPriceHistory` | `*` | The scaler must discover running nodes and query spot prices. All EC2 `Describe*` actions are read-only and do not support resource-level permissions. |
-| 2c | `scaler-s3-policy` | `s3:PutObject` | `arn:aws:s3:::k8s-college-cluster-<acct>/logs/*` | The scaler writes scaling-decision logs. Access is restricted to **only** the `logs/` prefix – it cannot read objects, list the bucket, or write to any other prefix. |
-
-### Why Some Resources Are `*`
-
-> Several AWS APIs (CloudWatch `PutMetricData`/`GetMetricData`,
-> EC2 `Describe*`) do not support resource-level permissions.
-> AWS documents this in the Service Authorization Reference.
-> We compensate by granting **only the single action needed**
-> and adding conditions where supported (e.g., the CloudWatch
-> namespace condition on `PutMetricData`).
-
-### No Wildcards
-
-- **No wildcard actions**: every `actions` list names explicit API calls.
-- **No wildcard resources** (except where AWS requires `*`): S3 policies
-  use the exact bucket ARN; the scaler S3 policy even narrows to `/logs/*`.
-
----
-
-## Quick-Start Commands
-
-```bash
-# 0.  Prerequisites
-#     - Terraform >= 1.5 installed
-#     - AWS CLI configured  (aws configure)
-#     - An EC2 key pair created in the target region
-
-# 1.  Clone & configure
-cd k8s-terraform
-cp terraform.tfvars.example terraform.tfvars
-#     → edit terraform.tfvars: set key_pair_name, allowed_ssh_cidrs
-
-# 2.  Initialize (downloads providers, initialises modules)
-terraform init
-
-# 3.  Preview what will be created
-terraform plan
-
-# 4.  Create the infrastructure
-terraform apply
-#     → type "yes" when prompted
-#     → note the outputs: IPs, bucket name, role ARNs
-
-# 5.  SSH into the control-plane
-ssh -i ~/.ssh/my-key.pem ubuntu@<control_plane_public_ip>
-
-# 6.  Tear down everything when finished
-terraform destroy
-#     → type "yes" to confirm
+                         OPERATOR / AWS CLOUDSHELL
+             (AWS CLI scripts, Terraform, Ansible, Locust Loadgen)
+                                   │
+                                   ▼
+  ┌───────────────────────── AWS LAB ENVIRONMENT ─────────────────────────┐
+  │  VPC: 10.0.0.0/16 (2 Public Subnets, IGW, Route Tables, Security Group) │
+  │                                                                        │
+  │   ┌──────────────────┐      ┌──────────────────┐ ┌──────────────────┐  │
+  │   │ Control Plane    │      │ Worker 1         │ │ Worker 2         │  │
+  │   │ t3.medium        │      │ t3.small         │ │ t3.small         │  │
+  │   │ - kube-apiserver │◄────►│ - kubelet        │◄│ - kubelet        │  │
+  │   │ - etcd           │      │ - Flask Pods     │ │ - Flask Pods     │  │
+  │   │ - Custom Scaler  │      │ - Metric Daemon  │ │ - Metric Daemon  │  │
+  │   └────────┬─────────┘      └────────┬─────────┘ └────────┬─────────┘  │
+  │            │ kubectl scale           │ PutMetricData      │            │
+  │            ▼                         ▼                    ▼            │
+  │      ┌───────────┐           ┌────────────────────────────────┐        │
+  │      │ K8s API   │           │      AWS CloudWatch            │        │
+  │      │ (No HPA)  │           │  Namespace: AutoScaler/App     │        │
+  │      └───────────┘           └───────────────┬────────────────┘        │
+  │                                              │ GetMetricData           │
+  │                                              ▼                         │
+  │            ┌───────────────────────────────────────────┐               │
+  │            │ S3 Bucket: Decision Logs, CSVs, Configs   │               │
+  │            └───────────────────────────────────────────┘               │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Outputs Reference
+## 4. Repository Structure
 
-| Output | Description |
-|--------|-------------|
-| `control_plane_public_ip` | Public IP of the control-plane EC2 instance |
-| `worker_public_ips` | List of public IPs for worker nodes |
-| `s3_bucket_name` | Name of the versioned/encrypted S3 bucket |
-| `s3_bucket_arn` | Full ARN of the S3 bucket |
-| `node_role_arn` | ARN of the node IAM role |
-| `scaler_role_arn` | ARN of the scaler IAM role |
-| `vpc_id` | ID of the VPC |
+```
+autoscaler/
+├── infra-cli/                  # Phase 1: AWS CLI provisioning scripts (CloudShell/Lab safe)
+│   ├── 01-prereqs.sh           # Validates AWS credentials, region, key pairs
+│   ├── 02-network.sh           # VPC, 2 subnets, IGW, route table, security group
+│   ├── 03-storage.sh           # S3 bucket, server-side encryption, lifecycle policy
+│   ├── 04-compute.sh           # EC2 instances: 1 control plane + 2 workers
+│   ├── 05-inventory.sh         # Generates Ansible inventory & state.env
+│   ├── 06-refresh-ips.sh       # Updates IPs if EC2 instances restart
+│   ├── 99-destroy.sh           # Safe cleanup of all AWS resources
+│   └── policies/               # Least-privilege IAM policy documents
+├── terraform/                  # Modular Terraform alternate IaC
+│   ├── main.tf
+│   ├── variables.tf
+│   └── modules/ (network, storage, compute, iam)
+├── ansible/                    # Phase 2: Configuration management
+│   ├── inventory.ini
+│   ├── site.yml
+│   └── roles/ (common, k8s-control, k8s-worker)
+├── app/                        # Phase 2: Workload
+│   ├── app.py                  # Flask REST API with synthetic CPU/latency endpoints
+│   ├── Dockerfile              # Container image
+│   └── publisher.py            # Metric publisher daemon for CloudWatch
+├── k8s/                        # Phase 2: Kubernetes resources (No HPA!)
+│   ├── namespace.yaml
+│   ├── deployment.yaml         # Resource requests/limits configured
+│   └── service.yaml
+├── scaler/                     # Phase 3 & 4: Custom autoscaler
+│   ├── config.yaml             # Tunable weights, SLO limits, pricing table
+│   ├── metrics.py              # CloudWatch reader
+│   ├── cost.py                 # Dollars-per-request calculation engine
+│   ├── guardrails.py           # Cooldown, bounds, hysteresis rules
+│   ├── scaler.py               # MAPE-K control loop with counterfactual JSON logging
+│   └── tests/                  # Unit tests for candidate selection
+├── benchmarks/                 # Phase 5: Experimentation & evaluation
+│   ├── loadgen.py              # Synthetic traffic generator (steady, ramp, spike)
+│   ├── delay_wrapper.py        # Injects telemetry delay D in {0, 60, 120, 180s}
+│   ├── baselines/              # Default HPA & Tuned HPA simulators
+│   ├── run_matrix.py           # Benchmark runner for all 35 test blocks
+│   └── analysis.py             # Generates publication-ready graphs & CSV summaries
+└── docs/                       # Research documentation
+    ├── SRS.md                  # Software Requirements Specification
+    └── EXPERIMENTS.md          # 35-run benchmark methodology
+```
 
 ---
 
-## Cost Notes
+## 5. Quick-Start Guide (Video Recording Ready)
 
-| Resource | Estimated Monthly Cost |
-|----------|----------------------|
-| 1 × t3.medium (control-plane) | ~$30 |
-| 2 × t3.small (workers) | ~$30 |
-| S3 bucket (minimal storage) | < $1 |
-| Data transfer (minimal) | < $1 |
-| **Total** | **~$61/month** |
-
-> **Tip:** Stop instances when not in use (`aws ec2 stop-instances`)
-> to save money.  Use `t3.micro` (free-tier eligible for 12 months)
-> for even lower cost, though K8s will be tight on 1 GB RAM.
-
----
-
-## Next Steps (After `terraform apply`)
-
-1. SSH into the control-plane and install `containerd` + `kubeadm`.
-2. Run `kubeadm init` on the control-plane.
-3. Join workers with `kubeadm join`.
-4. Install a CNI plugin (Flannel or Calico).
-5. Deploy your workloads!
-
----
-
-## License
-
-MIT – use freely for your college project.
+Follow the step-by-step commands provided in the project runbook to provision, configure, run, and benchmark the cluster.

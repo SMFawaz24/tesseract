@@ -1,0 +1,134 @@
+name: CI/CD Pipeline - Cost-per-Request Kubernetes Autoscaler
+
+on:
+  push:
+    branches: [ main, feature-branch, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  # ============================================================================
+  # 1. SCALER UNIT TESTING (Objective O4)
+  # ============================================================================
+  test-scaler:
+    name: Scaler Logic & Unit Tests (Pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Scaler Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pyyaml boto3 pandas requests
+
+    - name: Run Pytest Unit Tests
+      run: |
+        pytest scaler/tests/test_scaler.py -v
+
+  # ============================================================================
+  # 2. TERRAFORM IAC VALIDATION (Objective O1)
+  # ============================================================================
+  validate-terraform:
+    name: Terraform Format & Lint Validation
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Verify Terraform Formatting
+      run: |
+        terraform -chdir=terraform fmt -check
+
+    - name: Initialize Terraform Modules
+      run: |
+        terraform -chdir=terraform init -backend=false
+
+    - name: Validate Terraform Syntax
+      run: |
+        terraform -chdir=terraform validate
+
+  # ============================================================================
+  # 3. DOCKER & KUBERNETES MANIFEST LINTING (Objective O2)
+  # ============================================================================
+  validate-k8s-and-docker:
+    name: Container Build & K8s Manifest Lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Application Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./app
+        file: ./app/Dockerfile
+        push: false
+        tags: flask-api:test
+
+    - name: Validate Kubernetes Manifests Syntax
+      run: |
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+        # Client-side dry-run check on manifests
+        kubectl apply --dry-run=client -f k8s/app.yaml
+        echo "[✓] Kubernetes manifests are valid and compliant!"
+
+  # ============================================================================
+  # 4. BENCHMARK PIPELINE VERIFICATION (Objective O5 & O6)
+  # ============================================================================
+  verify-benchmarks:
+    name: Benchmark Matrix & Chart Generator Verification
+    runs-on: ubuntu-latest
+    needs: [test-scaler]
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Data Science Dependencies
+      run: |
+        pip install pandas matplotlib requests
+
+    - name: Execute Benchmark Matrix Simulation
+      run: |
+        python benchmarks/run_matrix.py
+        python benchmarks/analysis.py
+
+    - name: Verify Chart Artifacts Generated
+      run: |
+        test -f charts/cost_per_request_comparison.png
+        test -f charts/telemetry_delay_impact.png
+        test -f charts/safety_ablation_tradeoff.png
+        echo "[✓] All publication charts generated successfully!"
+
+    - name: Upload Research Charts as Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-research-charts
+        path: charts/*.png
+

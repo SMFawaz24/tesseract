@@ -1,0 +1,36 @@
+cloudwatch:
+  namespace: "AutoScaler/App"
+  region: "us-east-1"
+  period_seconds: 60
+
+weights:
+  cpu: 0.30
+  mem: 0.10
+  rps: 0.40
+  lat: 0.20
+
+slo:
+  target_p95_latency_ms: 100.0
+  max_utilization_ceiling: 0.70
+
+capacity:
+  capacity_per_pod_rps: 50.0
+
+pricing:
+  # t3.small on-demand list price is ~$0.0208/hr.
+  # Assuming 2 pods per t3.small node base allocation:
+  pod_cost_per_hour: 0.0104
+  node_price_per_hour: 0.0208
+
+guardrails:
+  min_replicas: 1
+  max_replicas: 8
+  cooldown_seconds: 45
+  max_step_size: 2
+  scale_up_hysteresis_score: 0.65
+  scale_down_hysteresis_score: 0.35
+
+s3:
+  bucket_name: ""  # Set automatically or via env BUCKET_NAME
+  log_prefix: "decision-logs/"
+
