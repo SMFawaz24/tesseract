@@ -321,14 +321,21 @@ def trigger_load():
     if req_type == "spike":
         # Simulate traffic surge
         def fire():
-            url = "http://localhost:30080/work?cpu_ms=30&io_ms=5"
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
-                futures = [ex.submit(requests.get, url, timeout=2.0) for _ in range(80)]
-                concurrent.futures.wait(futures)
+            for target in ["http://localhost:8080/work?cpu_ms=30&io_ms=5", "http://localhost:30080/work?cpu_ms=30&io_ms=5"]:
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                        futures = [ex.submit(requests.get, target, timeout=1.5) for _ in range(40)]
+                        concurrent.futures.wait(futures)
+                    break
+                except Exception:
+                    pass
         concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(fire)
 
-        # Scale pods to 4 live in Kubernetes
-        subprocess.run(["kubectl", "scale", "deployment", "flask-api", "-n", "autoscaler-app", "--replicas=4"])
+        # Scale pods to 4 live if Kubernetes is present
+        try:
+            subprocess.run(["kubectl", "scale", "deployment", "flask-api", "-n", "autoscaler-app", "--replicas=4"], check=False)
+        except Exception:
+            pass
 
         spike_record = {
             "ts": now_ts,
@@ -353,7 +360,10 @@ def trigger_load():
 
     else:
         # Reset to Idle
-        subprocess.run(["kubectl", "scale", "deployment", "flask-api", "-n", "autoscaler-app", "--replicas=2"])
+        try:
+            subprocess.run(["kubectl", "scale", "deployment", "flask-api", "-n", "autoscaler-app", "--replicas=2"], check=False)
+        except Exception:
+            pass
         idle_record = {
             "ts": now_ts,
             "current_replicas": 4,
